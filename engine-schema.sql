@@ -94,6 +94,11 @@ CREATE TABLE IF NOT EXISTS title_sources (
   region TEXT,                     -- e.g. 'PK', 'US'
   is_playable BOOLEAN NOT NULL DEFAULT FALSE,
   status TEXT NOT NULL DEFAULT 'unchecked' CHECK (status IN ('ok', 'broken', 'unchecked')),
+  -- v1.1.0: playback priority (lower = tried first), container format
+  -- ('mp4' | 'm3u8' | 'mpd' | ...), admin kill-switch.
+  priority INT NOT NULL DEFAULT 100,
+  format VARCHAR(10),
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
   last_checked_at TIMESTAMPTZ,
   last_seen_at TIMESTAMPTZ,        -- last sync run that still listed this source
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -119,6 +124,48 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_title_sources_unique
 CREATE INDEX IF NOT EXISTS idx_title_sources_movie ON title_sources (movie_id);
 CREATE INDEX IF NOT EXISTS idx_title_sources_series ON title_sources (series_id);
 CREATE INDEX IF NOT EXISTS idx_title_sources_status ON title_sources (status);
+
+-- v1.1.0 ALTERs: keep databases created from the pre-v1.1.0 schema in
+-- sync (the CREATE TABLE above already has these columns for fresh DBs).
+ALTER TABLE title_sources ADD COLUMN IF NOT EXISTS priority INT NOT NULL DEFAULT 100;
+ALTER TABLE title_sources ADD COLUMN IF NOT EXISTS format VARCHAR(10);
+ALTER TABLE title_sources ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT true;
+CREATE INDEX IF NOT EXISTS idx_title_sources_priority ON title_sources (priority);
+
+-- ------------------------------------------------------------------
+-- 3b. Provider registry (v1.1.0). The APK never knows about providers:
+-- it only calls GET /api/titles/:id/sources and plays returned URLs.
+-- Adding a provider = a row here (+ a new adapter module in
+-- engine/providers/ only if the source needs a new API shape).
+-- `name` is the stable key referenced by title_sources.provider_key.
+-- Disabling a provider hides its playable streams from the app with
+-- no APK change; its link-out rows stay visible.
+-- ------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS providers (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  adapter VARCHAR(50) NOT NULL,
+  config JSONB NOT NULL DEFAULT '{}',
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  last_sync_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO providers (name, adapter, config) VALUES
+  ('tmdb', 'tmdb',
+   '{"note": "TMDB watch-provider link-outs only; never playable"}'::jsonb),
+  ('archiveorg', 'archiveorg',
+   '{"query": "mediatype:movies AND collection:feature_films AND licenseurl:*publicdomain*", "sort": "downloads desc", "note": "Public-domain feature films; playable direct .mp4 streams"}'::jsonb),
+  ('generic_http', 'generic_http',
+   '{"note": "Admin-added direct URLs only; only public_domain rows with a direct .mp4/.m3u8/.mpd URL can be playable"}'::jsonb)
+ON CONFLICT (name) DO NOTHING;
+
+-- Link from title_sources to the registry (added after providers exists).
+-- A NULL provider_key means a legacy row (pre-registry): treated as
+-- enabled, so existing link-outs keep working unchanged.
+ALTER TABLE title_sources ADD COLUMN IF NOT EXISTS provider_key TEXT
+  REFERENCES providers(name) ON UPDATE CASCADE ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_title_sources_provider_key ON title_sources (provider_key);
 
 -- ------------------------------------------------------------------
 -- 4. Sync bookkeeping (single row, id = 1). Written by the daily sync.

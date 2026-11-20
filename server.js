@@ -29,6 +29,7 @@ app.get('/health', (req, res) => res.json({ ok: true, app: 'netfly' }));
 
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/movies', require('./routes/movies'));
+app.use('/api/titles', require('./routes/titles'));
 app.use('/api/series', require('./routes/series'));
 app.use('/api/search', require('./routes/search'));
 app.use('/api/watchlist', require('./routes/watchlist'));
