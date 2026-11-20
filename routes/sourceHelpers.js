@@ -46,12 +46,17 @@ async function getSources(pool, { movieId = null, seriesId = null }, authed) {
 // provider/trailer rows can never appear as playable, whatever flags
 // they carry. This list decides playability — a title is playable iff it
 // has >= 1 row here; the stored is_playable flag alone never makes a
-// title playable. Only the fields the player needs are returned.
+// title playable. Only the fields the player needs are returned —
+// including source_type / is_playable / status / enabled, which the
+// Flutter model needs to recognise a row as playable (2026-11-20 fix:
+// omitting them made the app filter every row out, so all 24 playable
+// titles showed 'Not available to stream' even when logged in).
 async function getPlayableSources(pool, { movieId = null, seriesId = null }) {
   const col = movieId != null ? 'movie_id' : 'series_id';
   const id = movieId != null ? movieId : seriesId;
   const { rows } = await pool.query(
-    `SELECT ts.id, ts.provider_name, ts.format, ts.url, ts.quality, ts.priority
+    `SELECT ts.id, ts.source_type, ts.provider_name, ts.format, ts.url, ts.quality, ts.priority,
+            ts.is_playable, ts.status, ts.enabled
      FROM title_sources ts
      LEFT JOIN providers p ON p.name = ts.provider_key
      WHERE ts.${col} = $1 AND ts.source_type = 'public_domain'
