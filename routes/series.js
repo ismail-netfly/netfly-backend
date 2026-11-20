@@ -1,6 +1,6 @@
 const express = require('express');
 const { optionalAuth } = require('../middleware/auth');
-const { getSources } = require('./sourceHelpers');
+const { getSources, getPlayableSources } = require('./sourceHelpers');
 
 const router = express.Router();
 
@@ -76,6 +76,24 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
     }
     const sources = await getSources(pool, { seriesId: series.id }, !!req.user);
     res.json({ data: { ...series, seasons, sources } });
+  } catch (e) { next(e); }
+});
+
+// GET /api/series/:id/sources — playable direct streams for a series,
+// ordered by priority ASC (same contract as /api/titles/:id/sources:
+// a series is playable iff this list is non-empty; authorised callers
+// only; broken / disabled sources never returned).
+router.get('/:id/sources', optionalAuth, async (req, res, next) => {
+  try {
+    const pool = req.app.locals.pool;
+    const { rows } = await pool.query(
+      'SELECT id FROM series WHERE id=$1 AND is_published = true',
+      [req.params.id],
+    );
+    if (!rows[0]) return res.status(404).json({ message: 'Series not found' });
+    if (!req.user) return res.json({ data: [] });
+    const sources = await getPlayableSources(pool, { seriesId: req.params.id });
+    res.json({ data: sources });
   } catch (e) { next(e); }
 });
 

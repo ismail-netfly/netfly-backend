@@ -1,6 +1,7 @@
 const express = require('express');
 const multer = require('multer');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { deriveFormatFromUrl } = require('./sourceHelpers');
 
 const router = express.Router();
 router.use(requireAuth, requireAdmin);
@@ -160,6 +161,21 @@ function isDirectMediaUrl(u) {
   return isHttpUrl(u) && /\.(mp4|m3u8|mpd|mov|webm)(\?|#|$)/i.test(u);
 }
 
+// Normalise a supplied format ('MP4' -> 'mp4'); null when unusable.
+function normaliseFormat(f) {
+  if (typeof f !== 'string') return null;
+  const fmt = f.trim().toLowerCase();
+  return /^[a-z0-9]{2,10}$/.test(fmt) ? fmt : null;
+}
+
+// Priority: integer, default 100 (lower = tried first). Returns null on
+// bad input so the caller can reject it.
+function parsePriority(p) {
+  if (p == null || p === '') return 100;
+  const n = Number(p);
+  return Number.isInteger(n) ? n : null;
+}
+
 function sourceTitleJoins() {
   return `LEFT JOIN movies m ON m.id = s.movie_id
           LEFT JOIN series se ON se.id = s.series_id`;
@@ -235,21 +251,31 @@ router.post('/sources', async (req, res, next) => {
     if (s.status && !SOURCE_STATUSES.includes(s.status)) {
       return res.status(400).json({ message: 'Invalid status' });
     }
+    const priority = parsePriority(s.priority);
+    if (priority == null) {
+      return res.status(400).json({ message: 'priority must be an integer' });
+    }
+    if (s.format != null && normaliseFormat(s.format) == null) {
+      return res.status(400).json({ message: 'Invalid format' });
+    }
     // Only public-domain rows may ever be playable, and only with a direct
     // media URL (a YouTube watch link must never become a "playable" stream).
     const isPlayable = s.source_type === 'public_domain' && !!s.is_playable;
     if (isPlayable && !isDirectMediaUrl(s.url)) {
       return res.status(400).json({ message: 'Playable public-domain sources need a direct media URL (.mp4 / .m3u8 / .mpd)' });
     }
+    // Format is derived from the URL extension when not supplied.
+    const format = normaliseFormat(s.format) || deriveFormatFromUrl(s.url);
     const { rows } = await pool.query(
       `INSERT INTO title_sources (movie_id, series_id, source_type, provider_name,
          provider_id, provider_logo_path, offer_type, url, language, quality,
-         region, is_playable, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+         region, is_playable, status, priority, format, enabled)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
       [s.movie_id || null, s.series_id || null, s.source_type, s.provider_name || null,
        s.provider_id || null, s.provider_logo_path || null, s.offer_type || null,
        s.url, s.language || null, s.quality || null, s.region || null,
-       isPlayable, s.status || 'unchecked'],
+       isPlayable, s.status || 'unchecked', priority, format,
+       s.enabled !== false],
     );
     res.status(201).json({ data: rows[0] });
   } catch (e) { next(e); }
@@ -269,6 +295,12 @@ router.put('/sources/:id', async (req, res, next) => {
     if (s.source_type && !SOURCE_TYPES.includes(s.source_type)) {
       return res.status(400).json({ message: 'Invalid source_type' });
     }
+    if (s.priority != null && parsePriority(s.priority) == null) {
+      return res.status(400).json({ message: 'priority must be an integer' });
+    }
+    if (s.format != null && normaliseFormat(s.format) == null) {
+      return res.status(400).json({ message: 'Invalid format' });
+    }
     // Validate the *resulting* row: a public_domain row that stays/would
     // become playable needs a direct media URL (never a YouTube page link).
     const existing = await pool.query(
@@ -283,6 +315,11 @@ router.put('/sources/:id', async (req, res, next) => {
     if (effType === 'public_domain' && effPlayable && !isDirectMediaUrl(effUrl)) {
       return res.status(400).json({ message: 'Playable public-domain sources need a direct media URL (.mp4 / .m3u8 / .mpd)' });
     }
+    // Format: supplied value wins; otherwise re-derive from the new URL
+    // when the URL changes; otherwise keep the stored value.
+    const format = s.format != null
+      ? normaliseFormat(s.format)
+      : (s.url ? deriveFormatFromUrl(s.url) : null);
     const { rows } = await pool.query(
       `UPDATE title_sources SET
          url = COALESCE($2, url),
@@ -298,13 +335,18 @@ router.put('/sources/:id', async (req, res, next) => {
          is_playable = CASE WHEN COALESCE($11, source_type) = 'public_domain'
                             THEN COALESCE($12, is_playable) ELSE FALSE END,
          source_type = COALESCE($11, source_type),
+         priority = COALESCE($13, priority),
+         format = COALESCE($14, format),
+         enabled = COALESCE($15, enabled),
          last_checked_at = CASE WHEN $10 IS NOT NULL THEN NOW() ELSE last_checked_at END,
          updated_at = NOW()
        WHERE id = $1 RETURNING *`,
       [req.params.id, s.url || null, s.provider_name || null, s.provider_id || null,
        s.provider_logo_path || null, s.offer_type || null, s.language || null,
        s.quality || null, s.region || null, s.status || null,
-       s.source_type || null, s.is_playable == null ? null : !!s.is_playable],
+       s.source_type || null, s.is_playable == null ? null : !!s.is_playable,
+       s.priority == null ? null : parsePriority(s.priority), format,
+       s.enabled == null ? null : !!s.enabled],
     );
     if (!rows[0]) return res.status(404).json({ message: 'Source not found' });
     res.json({ data: rows[0] });
@@ -319,19 +361,182 @@ router.delete('/sources/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// GET /api/admin/providers — distinct providers in use, with broken counts.
+// GET /api/admin/sources/health — source-health overview: playable-ok /
+// broken / unchecked counts + the broken list (newest first, max 200).
+router.get('/sources/health', async (req, res, next) => {
+  try {
+    const pool = req.app.locals.pool;
+    const counts = await pool.query(
+      `SELECT COUNT(*) FILTER (WHERE is_playable AND enabled AND status = 'ok' AND stream_validated)::int AS playable_ok,
+              COUNT(*) FILTER (WHERE status = 'broken')::int AS broken,
+              COUNT(*) FILTER (WHERE status = 'unchecked')::int AS unchecked,
+              COUNT(*) FILTER (WHERE status = 'ok')::int AS ok,
+              COUNT(*)::int AS total
+       FROM title_sources`,
+    );
+    const broken = await pool.query(
+      `${sourceSelect()} WHERE s.status = 'broken' ORDER BY s.updated_at DESC LIMIT 200`,
+    );
+    // Per-provider breakdown (registry rows + legacy provider names).
+    const perProvider = await pool.query(
+      `SELECT p.name AS provider_name, p.enabled, p.last_sync_at,
+              COALESCE(c.total, 0)::int AS total,
+              COALESCE(c.ok, 0)::int AS ok,
+              COALESCE(c.broken, 0)::int AS broken,
+              COALESCE(c.unchecked, 0)::int AS unchecked,
+              COALESCE(c.playable_ok, 0)::int AS playable_ok
+       FROM providers p
+       LEFT JOIN (
+         SELECT provider_key,
+                COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE status = 'ok')::int AS ok,
+                COUNT(*) FILTER (WHERE status = 'broken')::int AS broken,
+                COUNT(*) FILTER (WHERE status = 'unchecked')::int AS unchecked,
+                COUNT(*) FILTER (WHERE is_playable AND enabled AND status = 'ok' AND stream_validated)::int AS playable_ok
+         FROM title_sources WHERE provider_key IS NOT NULL GROUP BY provider_key
+       ) c ON c.provider_key = p.name
+       UNION ALL
+       SELECT provider_name, TRUE, NULL,
+              COUNT(*)::int, COUNT(*) FILTER (WHERE status = 'ok')::int,
+              COUNT(*) FILTER (WHERE status = 'broken')::int,
+              COUNT(*) FILTER (WHERE status = 'unchecked')::int,
+              COUNT(*) FILTER (WHERE is_playable AND enabled AND status = 'ok' AND stream_validated)::int
+       FROM title_sources WHERE provider_key IS NULL AND provider_name IS NOT NULL
+       GROUP BY provider_name
+       ORDER BY total DESC`,
+    );
+    res.json({ data: { ...counts.rows[0], providers: perProvider.rows, broken_sources: broken.rows } });
+  } catch (e) { next(e); }
+});
+
+// --- Provider registry ---------------------------------------------------
+// GET /api/admin/providers — registry rows with per-provider last_sync_at
+// + source counts. Shape-compatible with the app's Providers tab, which
+// reads provider_name, count (or total) and broken_count: those keys are
+// all present. Legacy provider link-outs with no registry row (e.g.
+// Netflix, YouTube trailer rows) are appended as registry-less groups
+// with adapter null so nothing the app already showed disappears.
 router.get('/providers', async (req, res, next) => {
   try {
     const pool = req.app.locals.pool;
-    const { rows } = await pool.query(
-      `SELECT provider_name, source_type,
-              COUNT(*)::int AS total,
+    const registry = await pool.query(
+      `SELECT p.id, p.name, p.name AS provider_name, p.adapter, p.config,
+              p.enabled, p.last_sync_at, p.created_at,
+              COALESCE(c.total, 0)::int AS total,
+              COALESCE(c.total, 0)::int AS count,
+              COALESCE(c.ok, 0)::int AS ok,
+              COALESCE(c.ok, 0)::int AS ok_count,
+              COALESCE(c.broken, 0)::int AS broken,
+              COALESCE(c.broken, 0)::int AS broken_count,
+              COALESCE(c.unchecked, 0)::int AS unchecked,
+              COALESCE(c.playable, 0)::int AS playable,
+              NULL::text AS source_type
+       FROM providers p
+       LEFT JOIN (
+         SELECT provider_key,
+                COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE status = 'ok')::int AS ok,
+                COUNT(*) FILTER (WHERE status = 'broken')::int AS broken,
+                COUNT(*) FILTER (WHERE status = 'unchecked')::int AS unchecked,
+                COUNT(*) FILTER (WHERE is_playable)::int AS playable
+         FROM title_sources WHERE provider_key IS NOT NULL GROUP BY provider_key
+       ) c ON c.provider_key = p.name
+       ORDER BY total DESC, p.name`,
+    );
+    const legacy = await pool.query(
+      `SELECT NULL::int AS id, NULL::text AS name,
+              provider_name, NULL::varchar AS adapter, NULL::jsonb AS config,
+              TRUE AS enabled, NULL::timestamptz AS last_sync_at,
+              NULL::timestamptz AS created_at,
+              COUNT(*)::int AS total, COUNT(*)::int AS count,
+              COUNT(*) FILTER (WHERE status = 'ok')::int AS ok,
+              COUNT(*) FILTER (WHERE status = 'ok')::int AS ok_count,
               COUNT(*) FILTER (WHERE status = 'broken')::int AS broken,
-              COUNT(*) FILTER (WHERE status = 'unchecked')::int AS unchecked
-       FROM title_sources WHERE provider_name IS NOT NULL
+              COUNT(*) FILTER (WHERE status = 'broken')::int AS broken_count,
+              COUNT(*) FILTER (WHERE status = 'unchecked')::int AS unchecked,
+              COUNT(*) FILTER (WHERE is_playable)::int AS playable,
+              source_type
+       FROM title_sources
+       WHERE provider_name IS NOT NULL AND provider_key IS NULL
        GROUP BY provider_name, source_type ORDER BY total DESC`,
     );
-    res.json({ data: rows });
+    res.json({ data: [...registry.rows, ...legacy.rows] });
+  } catch (e) { next(e); }
+});
+
+// POST /api/admin/providers — register a provider. `name` is the stable
+// key other rows reference; `adapter` must be a known engine adapter.
+router.post('/providers', async (req, res, next) => {
+  try {
+    const pool = req.app.locals.pool;
+    const p = req.body || {};
+    if (!/^[a-z0-9-]+$/.test(p.name || '')) {
+      return res.status(400).json({ message: 'name must be lowercase letters, digits and hyphens' });
+    }
+    if (!/^[a-z0-9_]+$/.test(p.adapter || '')) {
+      return res.status(400).json({ message: 'adapter is required (e.g. archiveorg, tmdb, generic_http)' });
+    }
+    if (p.config != null && typeof p.config !== 'object') {
+      return res.status(400).json({ message: 'config must be a JSON object' });
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO providers (name, adapter, config, enabled)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [p.name, p.adapter, JSON.stringify(p.config || {}), p.enabled !== false],
+    );
+    res.status(201).json({ data: rows[0] });
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ message: 'Provider name already exists' });
+    next(e);
+  }
+});
+
+// PUT /api/admin/providers/:id — rename is not allowed (name is the key
+// title_sources references); adapter/config/enabled can change. Disabling
+// (enabled=false) hides that provider's playable streams from the app
+// immediately, with no APK change.
+router.put('/providers/:id', async (req, res, next) => {
+  try {
+    const pool = req.app.locals.pool;
+    const p = req.body || {};
+    if (p.adapter != null && !/^[a-z0-9_]+$/.test(p.adapter)) {
+      return res.status(400).json({ message: 'Invalid adapter' });
+    }
+    if (p.config != null && typeof p.config !== 'object') {
+      return res.status(400).json({ message: 'config must be a JSON object' });
+    }
+    const { rows } = await pool.query(
+      `UPDATE providers SET
+         adapter = COALESCE($2, adapter),
+         config = COALESCE($3, config),
+         enabled = COALESCE($4, enabled)
+       WHERE id = $1 RETURNING *`,
+      [req.params.id, p.adapter || null,
+       p.config == null ? null : JSON.stringify(p.config),
+       p.enabled == null ? null : !!p.enabled],
+    );
+    if (!rows[0]) return res.status(404).json({ message: 'Provider not found' });
+    res.json({ data: rows[0] });
+  } catch (e) { next(e); }
+});
+
+// DELETE /api/admin/providers/:id — refused while any title_sources row
+// still references the provider (delete or reassign those first), so a
+// delete can never silently un-hide streams by dropping the link.
+router.delete('/providers/:id', async (req, res, next) => {
+  try {
+    const pool = req.app.locals.pool;
+    const refs = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM title_sources ts
+       JOIN providers p ON p.name = ts.provider_key WHERE p.id = $1`,
+      [req.params.id],
+    );
+    if (refs.rows[0].n > 0) {
+      return res.status(409).json({ message: 'Provider still has sources attached; delete or reassign them first' });
+    }
+    const { rowCount } = await pool.query('DELETE FROM providers WHERE id = $1', [req.params.id]);
+    if (!rowCount) return res.status(404).json({ message: 'Provider not found' });
+    res.json({ message: 'Provider deleted' });
   } catch (e) { next(e); }
 });
 
